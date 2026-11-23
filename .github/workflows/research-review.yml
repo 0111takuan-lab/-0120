@@ -35,6 +35,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: salmon-research-review-candidates
-          path: research/review/
-          if-no-files-found: warn
           path: research/review_candidates.json
+          if-no-files-found: warn
+
