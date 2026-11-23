@@ -1,0 +1,40 @@
+
+name: Research candidate collection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check required files
+        run: |
+          test -f scripts/collect.py
+          test -f research/sources.json
+
+      - name: Collect research candidates
+        run: |
+          mkdir -p research/review
+          python scripts/collect.py
+
+      - name: Upload research results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: salmon-research-review-candidates
+          path: research/review/
+          if-no-files-found: warn
+          path: research/review_candidates.json
