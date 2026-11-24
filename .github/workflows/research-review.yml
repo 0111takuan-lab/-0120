@@ -30,3 +30,9 @@ jobs:
           name: salmon-research-review-candidates
           path: research/review_candidates.json
           if-no-files-found: error
+      - name: Show research results
+        run: |
+          echo '## Research results' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat research/review_candidates.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
