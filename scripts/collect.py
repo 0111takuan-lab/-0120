@@ -3,6 +3,8 @@
 No automatic publication. Uses Python standard library only.
 """
 import json
+import time
+import unicodedata
 import re
 import urllib.error
 import urllib.parse
@@ -72,6 +74,111 @@ def extract_links(html, base_url):
     return candidates
 
 
+# Ver.3: bounded, review-only extraction of explicitly labelled HP values.
+ENEMIES = ('コジャケ','ドスコイ','シャケ','バクダン','ヘビ','テッパン','タワー','モグラ','カタパッド','コウモリ','ハシラ','ダイバー','テッキュウ','ナベブタ','グリル','キンシャケ','ヨコヅナ','タツ','ジョー','シャケコプター','ハコビヤ','ドロシャケ')
+MAX_DETAIL_PAGES = 8
+
+class DetailParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks = []
+        self.parts = []
+        self.skip = 0
+        self.heading = ''
+    def flush(self):
+        text = re.sub(r'\s+', ' ', ''.join(self.parts)).strip()
+        if text:
+            self.blocks.append((self.heading, text))
+        self.parts = []
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script','style','nav'):
+            self.skip += 1
+        if self.skip:
+            return
+        if tag in ('h1','h2','h3','h4','p','tr','li','br'):
+            self.flush()
+        if tag in ('td','th'):
+            self.parts.append(' ')
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+    def handle_endtag(self, tag):
+        if tag in ('script','style','nav'):
+            self.skip = max(0,self.skip-1)
+            return
+        if self.skip:
+            return
+        if tag in ('h1','h2','h3','h4'):
+            self.heading = ''.join(self.parts).strip()
+        if tag in ('h1','h2','h3','h4','p','tr','li'):
+            self.flush()
+
+
+def extract_hp(html, url, title):
+    parser = DetailParser()
+    parser.feed(html)
+    parser.flush()
+    found = []
+    seen = set()
+    for heading, block in parser.blocks:
+        block = unicodedata.normalize('NFKC', block)
+        # Only explicit labels followed by a number; no inferred values.
+        matches = list(re.finditer(r'(?:HP|体力|耐久値)\s*[:：=]?\s*([0-9][0-9,]*)(?![0-9,.])', block, re.I))
+        if not matches:
+            continue
+        names = [n for n in ENEMIES if n in heading or n in block]
+        names = [n for n in names if not any(n != m and n in m for m in names)]
+        if not names and title.strip() in ENEMIES:
+            names = [title.strip()]
+        if len(names) != 1:
+            continue
+        for match in matches:
+            hp = int(match.group(1).replace(',', ''))
+            key = (names[0], hp, url)
+            if hp <= 0 or key in seen:
+                continue
+            seen.add(key)
+            found.append({'name': names[0], 'hp_candidate': hp, 'source_url': url,
+                          'checked_at': datetime.now(timezone.utc).isoformat(),
+                          'status': 'needs_review', 'matched_label': match.group(0)[:40],
+                          'section': heading[:100]})
+    return found
+
+
+def collect_details(row):
+    row['enemy_candidates'] = []
+    row['detail_checks'] = []
+    links = [x for x in row['page_candidates'] if any(n in x['title'] for n in ENEMIES) or 'オオモノ' in x['title']]
+    links.sort(key=lambda x: (x['title'] not in ENEMIES, 'シャケについて' not in x['title']))
+    seen = set()
+    for link in links[:MAX_DETAIL_PAGES]:
+        time.sleep(2)
+        check = {'url': link['url'], 'title': link['title']}
+        try:
+            req = urllib.request.Request(link['url'], headers={'User-Agent': 'SalmonLabResearch/0.4 (review only)', 'Accept': 'text/html'})
+            with urllib.request.urlopen(req, timeout=20) as response:
+                check['http_status'] = response.status
+                if urllib.parse.urlsplit(response.geturl()).hostname != urllib.parse.urlsplit(row['source_url']).hostname:
+                    raise ValueError('Unexpected redirect host')
+                if 'html' not in response.headers.get('Content-Type','').lower():
+                    raise ValueError('Not HTML')
+                data = response.read(MAX_BYTES+1)
+                if len(data)>MAX_BYTES:
+                    raise ValueError('Page exceeds size limit')
+                html = data.decode(response.headers.get_content_charset() or 'utf-8', errors='replace')
+                candidates = extract_hp(html, response.geturl(), link['title'])
+                check['candidate_count'] = len(candidates)
+                for candidate in candidates:
+                    key = (candidate['name'], candidate['hp_candidate'], candidate['source_url'])
+                    if key not in seen:
+                        seen.add(key)
+                        row['enemy_candidates'].append(candidate)
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+            check['error'] = str(exc)
+        row['detail_checks'].append(check)
+    row['detail_status'] = 'needs_review' if row['enemy_candidates'] else 'no_candidates'
+
+
 def main():
     raw = json.loads(SOURCE_FILE.read_text(encoding='utf-8'))
     sources = raw if isinstance(raw, list) else raw.get('sources', [])
@@ -100,11 +207,13 @@ def main():
                     row['warning'] = 'Not an HTML page'
         except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
             row['error'] = str(exc)
+        row['collector_version'] = 3
+        collect_details(row)
         results.append(row)
         print(f"{row['name']}: HTTP {row.get('http_status', 'ERROR')}; candidate links {len(row['page_candidates'])}")
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(json.dumps(results, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    print('候補リンクを保存しました。数値・弱点は未抽出で、自動公開はしません。')
+    print('Ver.3: 候補リンクとHP候補を保存しました。自動公開はしません。')
 
 
 if __name__ == '__main__':
