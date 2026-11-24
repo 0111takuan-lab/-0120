@@ -76,7 +76,10 @@ def extract_links(html, base_url):
 
 # Ver.3: bounded, review-only extraction of explicitly labelled HP values.
 ENEMIES = ('コジャケ','ドスコイ','シャケ','バクダン','ヘビ','テッパン','タワー','モグラ','カタパッド','コウモリ','ハシラ','ダイバー','テッキュウ','ナベブタ','グリル','キンシャケ','ヨコヅナ','タツ','ジョー','シャケコプター','ハコビヤ','ドロシャケ')
-MAX_DETAIL_PAGES = 8
+MAX_DETAIL_PAGES = 4
+STATE = ROOT / "research" / "collection_state.json"
+INTERVAL = 15
+
 
 class DetailParser(HTMLParser):
     def __init__(self):
@@ -145,14 +148,39 @@ def extract_hp(html, url, title):
     return found
 
 
-def collect_details(row):
-    row['enemy_candidates'] = []
-    row['detail_checks'] = []
+def save_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(STATE)
+
+
+def cooldown(exc):
+    from email.utils import parsedate_to_datetime
+    value = exc.headers.get('Retry-After', '') if exc.headers else ''
+    try:
+        seconds = int(value)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            seconds = 0
+    return time.time() + max(3600, seconds)
+
+
+def collect_details(row, state):
+    saved = state.setdefault('sources', {}).setdefault(row['source_url'], {'done': {}, 'links': []})
+    done = saved['done']
     links = [x for x in row['page_candidates'] if any(n in x['title'] for n in ENEMIES) or 'オオモノ' in x['title']]
     links.sort(key=lambda x: (x['title'] not in ENEMIES, 'シャケについて' not in x['title']))
-    seen = set()
-    for link in links[:MAX_DETAIL_PAGES]:
-        time.sleep(2)
+    if links:
+        saved['links'] = links
+    links = saved['links']
+    row['detail_checks'] = []
+    for link in [x for x in links if x['url'] not in done][:MAX_DETAIL_PAGES]:
+        if time.time() < state.get('blocked_until', 0):
+            break
+        time.sleep(INTERVAL)
         check = {'url': link['url'], 'title': link['title']}
         try:
             req = urllib.request.Request(link['url'], headers={'User-Agent': 'SalmonLabResearch/0.4 (review only)', 'Accept': 'text/html'})
@@ -165,21 +193,29 @@ def collect_details(row):
                 data = response.read(MAX_BYTES+1)
                 if len(data)>MAX_BYTES:
                     raise ValueError('Page exceeds size limit')
-                html = data.decode(response.headers.get_content_charset() or 'utf-8', errors='replace')
-                candidates = extract_hp(html, response.geturl(), link['title'])
+                candidates = extract_hp(data.decode(response.headers.get_content_charset() or 'utf-8', errors='replace'), response.geturl(), link['title'])
                 check['candidate_count'] = len(candidates)
-                for candidate in candidates:
-                    key = (candidate['name'], candidate['hp_candidate'], candidate['source_url'])
-                    if key not in seen:
-                        seen.add(key)
-                        row['enemy_candidates'].append(candidate)
+                done[link['url']] = candidates
+        except urllib.error.HTTPError as exc:
+            check['http_status'] = exc.code
+            check['error'] = str(exc)
+            if exc.code in (403, 429, 503):
+                state['blocked_until'] = cooldown(exc)
         except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
             check['error'] = str(exc)
         row['detail_checks'].append(check)
-    row['detail_status'] = 'needs_review' if row['enemy_candidates'] else 'no_candidates'
+        save_state(state)
+    unique = {}
+    for candidates in done.values():
+        for c in candidates:
+            unique[(c['name'], c['hp_candidate'], c['source_url'])] = c
+    row['enemy_candidates'] = list(unique.values())
+    row['progress'] = {'checked_pages': sum(x['url'] in done for x in links), 'total_pages': len(links), 'blocked_until': state.get('blocked_until', 0)}
+    row['detail_status'] = 'needs_review' if unique else 'no_candidates'
 
 
 def main():
+    state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
     raw = json.loads(SOURCE_FILE.read_text(encoding='utf-8'))
     sources = raw if isinstance(raw, list) else raw.get('sources', [])
     results = []
@@ -190,6 +226,9 @@ def main():
                'checked_at': datetime.now(timezone.utc).isoformat(),
                'status': 'needs_review', 'page_candidates': []}
         try:
+            if time.time() < state.get('blocked_until', 0):
+                raise ValueError('Cooldown active; no network request')
+            time.sleep(INTERVAL)
             req = urllib.request.Request(item['url'], headers={'User-Agent': 'SalmonLabResearch/0.3 (research review; no automatic publishing)', 'Accept': 'text/html'})
             with urllib.request.urlopen(req, timeout=20) as response:
                 row['http_status'] = response.status
@@ -205,15 +244,21 @@ def main():
                     row['page_candidates'] = extract_links(html, final_url)
                 else:
                     row['warning'] = 'Not an HTML page'
+        except urllib.error.HTTPError as exc:
+            row['http_status'] = exc.code
+            row['error'] = str(exc)
+            if exc.code in (403, 429, 503):
+                state['blocked_until'] = cooldown(exc)
         except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
             row['error'] = str(exc)
-        row['collector_version'] = 3
-        collect_details(row)
+        row['collector_version'] = 4
+        collect_details(row, state)
+        save_state(state)
         results.append(row)
         print(f"{row['name']}: HTTP {row.get('http_status', 'ERROR')}; candidate links {len(row['page_candidates'])}")
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(json.dumps(results, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    print('Ver.3: 候補リンクとHP候補を保存しました。自動公開はしません。')
+    print('Ver.4: 候補リンクとHP候補を保存しました。自動公開はしません。')
 
 
 if __name__ == '__main__':
